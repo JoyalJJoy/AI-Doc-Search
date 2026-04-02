@@ -1,0 +1,8 @@
+[project]
+name = "documind-backend"
+version = "0.1.0"
+description = "DocuMind AI backend"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+
+# Dependencies are managed in requirements.txt for now.
