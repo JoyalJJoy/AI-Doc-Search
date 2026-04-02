@@ -140,10 +140,10 @@ To keep this repo professional and production-minded:
 - Authentication and multi-user workspaces
 - Cloud deployment
 
-## Author
-
-Joyal
-
 ## License
 
-Open-source and free to use.
+Licensed under the Apache License, Version 2.0. See `LICENSE`.
+
+## Author
+
+Joyal J Joy
