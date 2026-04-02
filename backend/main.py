@@ -28,8 +28,20 @@ INDEX_PATH = os.path.join(BASE_DIR, "storage", "index.json")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+def load_embedding_model() -> SentenceTransformer:
+    try:
+        # Prefer the local cache so backend restarts do not need network access.
+        return SentenceTransformer(EMBEDDING_MODEL_NAME, local_files_only=True)
+    except OSError:
+        return SentenceTransformer(EMBEDDING_MODEL_NAME)
+
 # Load local embedding model (only loads once)
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = load_embedding_model()
 
 # Load .env if present (simple parser to avoid extra dependencies)
 def load_env_file() -> None:
@@ -93,6 +105,81 @@ def save_index(index: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
     with open(INDEX_PATH, "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
+
+def read_env_value(*keys: str) -> str:
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value and not value.startswith("your_"):
+            return value
+    return ""
+
+def looks_like_gemini_key(value: str) -> bool:
+    return value.startswith("AIza")
+
+def resolve_llm_settings(requested_model: Optional[str]) -> Dict[str, Optional[str]]:
+    configured_provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    configured_model = (requested_model or read_env_value("LLM_MODEL", "OPENAI_MODEL")).strip()
+    openai_api_key = read_env_value("OPENAI_API_KEY")
+    gemini_api_key = read_env_value("GEMINI_API_KEY")
+    legacy_gemini_key = openai_api_key if looks_like_gemini_key(openai_api_key) else ""
+
+    if configured_provider in {"openai", "gemini"}:
+        provider = configured_provider
+    elif configured_model.startswith("gemini"):
+        provider = "gemini"
+    elif gemini_api_key and not openai_api_key:
+        provider = "gemini"
+    elif legacy_gemini_key:
+        provider = "gemini"
+    else:
+        provider = "openai"
+
+    if provider == "gemini":
+        api_key = gemini_api_key or legacy_gemini_key or openai_api_key
+        model_name = configured_model or DEFAULT_GEMINI_MODEL
+        if model_name == DEFAULT_OPENAI_MODEL:
+            model_name = DEFAULT_GEMINI_MODEL
+        base_url = os.getenv("GEMINI_BASE_URL", "").strip() or GEMINI_OPENAI_BASE_URL
+    else:
+        api_key = openai_api_key
+        model_name = configured_model or DEFAULT_OPENAI_MODEL
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
+
+    return {
+        "provider": provider,
+        "api_key": api_key,
+        "model_name": model_name,
+        "base_url": base_url,
+    }
+
+def extract_chat_text(response: Any) -> str:
+    choices = getattr(response, "choices", []) or []
+    if not choices:
+        return ""
+
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+
+    parts: List[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        if isinstance(text, dict):
+            value = text.get("value")
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(part.strip() for part in parts if part.strip())
 
 class QueryRequest(BaseModel):
     question: str
@@ -249,22 +336,28 @@ def ask_docs(payload: AskRequest):
             "message": "No documents indexed yet.",
         }
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key or api_key == "your_api_key_here":
+    llm_settings = resolve_llm_settings(payload.model)
+    provider = str(llm_settings["provider"])
+    api_key = str(llm_settings["api_key"] or "").strip()
+    model_name = str(llm_settings["model_name"] or "").strip()
+    base_url = llm_settings["base_url"]
+
+    if not api_key:
+        provider_label = "Gemini" if provider == "gemini" else "OpenAI"
+        env_hint = "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY"
         raise HTTPException(
             status_code=400,
-            detail="OPENAI_API_KEY is missing. Add it to backend/.env or your environment.",
+            detail=f"{provider_label} API key is missing. Add {env_hint} to backend/.env or your environment.",
         )
 
     try:
-        from openai import OpenAI
+        from openai import APIStatusError, AuthenticationError, OpenAI, OpenAIError
     except ImportError as exc:
         raise HTTPException(
             status_code=500,
             detail="OpenAI SDK not installed. Run: pip install openai",
         ) from exc
 
-    model_name = (payload.model or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini").strip()
     context_blocks = []
     for item in results:
         source = f"{item['filename']} (page {item['page']})"
@@ -276,22 +369,45 @@ def ask_docs(payload: AskRequest):
         "If the context is insufficient, say you don't know. "
         "Cite sources by filename and page in parentheses."
     )
-    prompt = f"Context:\n{context_text}\n\nQuestion: {question}\nAnswer:"
+    user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}\nAnswer:"
 
-    client = OpenAI()
-    response = client.responses.create(
-        model=model_name,
-        instructions=instructions,
-        input=prompt,
-        max_output_tokens=350,
-        temperature=0.2,
-    )
+    try:
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=350,
+            temperature=0.2,
+        )
+    except AuthenticationError as exc:
+        provider_label = "Gemini" if provider == "gemini" else "OpenAI"
+        env_hint = "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY"
+        raise HTTPException(
+            status_code=401,
+            detail=f"{provider_label} API key is invalid or revoked. Update {env_hint} in backend/.env.",
+        ) from exc
+    except APIStatusError as exc:
+        provider_label = "Gemini" if provider == "gemini" else "OpenAI"
+        raise HTTPException(
+            status_code=502,
+            detail=f"{provider_label} API request failed with status {exc.status_code}.",
+        ) from exc
+    except OpenAIError as exc:
+        provider_label = "Gemini" if provider == "gemini" else "OpenAI"
+        raise HTTPException(
+            status_code=502,
+            detail=f"{provider_label} API request failed: {exc.__class__.__name__}.",
+        ) from exc
 
-    answer_text = getattr(response, "output_text", "") or ""
+    answer_text = extract_chat_text(response)
 
     return {
         "answer": answer_text,
         "results": results,
         "total_chunks": total_chunks,
         "model": model_name,
+        "provider": provider,
     }

@@ -18,11 +18,22 @@ type SearchResult = {
   chunk_index: number;
 };
 
-type AskResponse = {
-  answer: string;
+type SearchPayload = {
+  question: string;
+  top_k: number;
+  filename?: string;
+};
+
+type QueryResponse = {
   results: SearchResult[];
   total_chunks: number;
+  message?: string;
+};
+
+type AskResponse = QueryResponse & {
+  answer: string;
   model?: string;
+  provider?: string;
 };
 
 const API_BASE = "http://127.0.0.1:8000";
@@ -36,7 +47,7 @@ export default function Home() {
   const [question, setQuestion] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [searchError, setSearchError] = useState("");
-  const [isSearching, setIsSearching] = useState(false);
+  const [activeAction, setActiveAction] = useState<"query" | "ask" | null>(null);
   const [scopeToLatest, setScopeToLatest] = useState(true);
   const [answer, setAnswer] = useState("");
   const [modelUsed, setModelUsed] = useState("");
@@ -84,30 +95,73 @@ export default function Home() {
     }
   };
 
-  const handleSearch = async () => {
+  const buildSearchPayload = (): SearchPayload | null => {
     setSearchError("");
-    setAnswer("");
-    setModelUsed("");
     if (!question.trim()) {
       setSearchError("Type a question to search.");
+      return null;
+    }
+
+    const payload: SearchPayload = {
+      question: question.trim(),
+      top_k: 5,
+    };
+
+    if (scopeToLatest && uploadInfo?.filename) {
+      payload.filename = uploadInfo.filename;
+    }
+
+    return payload;
+  };
+
+  const handleSemanticSearch = async () => {
+    const payload = buildSearchPayload();
+    setAnswer("");
+    setModelUsed("");
+
+    if (!payload) {
       return;
     }
 
-    setIsSearching(true);
+    setActiveAction("query");
     try {
-      const payload: {
-        question: string;
-        top_k: number;
-        filename?: string;
-      } = {
-        question: question.trim(),
-        top_k: 5,
-      };
+      const res = await fetch(`${API_BASE}/query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
 
-      if (scopeToLatest && uploadInfo?.filename) {
-        payload.filename = uploadInfo.filename;
+      const data = (await res.json()) as QueryResponse & { detail?: string; error?: string };
+      if (!res.ok) {
+        setSearchError(data.detail || "Semantic search failed.");
+        return;
+      }
+      if (data.error) {
+        setSearchError(data.error);
+        return;
       }
 
+      setResults(data.results || []);
+    } catch (err) {
+      console.error(err);
+      setSearchError("Semantic search failed.");
+    } finally {
+      setActiveAction(null);
+    }
+  };
+
+  const handleGenerateAnswer = async () => {
+    const payload = buildSearchPayload();
+    setSearchError("");
+    setAnswer("");
+    setModelUsed("");
+
+    if (!payload) {
+      return;
+    }
+
+    setActiveAction("ask");
+    try {
       const res = await fetch(`${API_BASE}/ask`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -116,7 +170,7 @@ export default function Home() {
 
       const data = (await res.json()) as AskResponse & { detail?: string; error?: string };
       if (!res.ok) {
-        setSearchError(data.detail || "Search failed.");
+        setSearchError(data.detail || "Answer generation failed.");
         return;
       }
       if (data.error) {
@@ -129,9 +183,9 @@ export default function Home() {
       setModelUsed(data.model || "");
     } catch (err) {
       console.error(err);
-      setSearchError("Search failed.");
+      setSearchError("Answer generation failed.");
     } finally {
-      setIsSearching(false);
+      setActiveAction(null);
     }
   };
 
@@ -220,7 +274,7 @@ export default function Home() {
 
           <section className="panel flex flex-col gap-6 rounded-3xl p-6 md:p-8">
             <h2 className="text-2xl font-[var(--font-display)] text-slate-900">
-              2. Ask a Question
+              2. Search Or Ask
             </h2>
             <div className="flex flex-col gap-3">
               <input
@@ -241,13 +295,22 @@ export default function Home() {
               </label>
             </div>
 
-            <button
-              onClick={handleSearch}
-              disabled={isSearching}
-              className="w-full rounded-2xl bg-slate-900 px-6 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-500"
-            >
-              {isSearching ? "Searching..." : "Run Semantic Search"}
-            </button>
+            <div className="grid gap-3 md:grid-cols-2">
+              <button
+                onClick={handleSemanticSearch}
+                disabled={activeAction !== null}
+                className="w-full rounded-2xl border border-slate-300/80 bg-white px-6 py-3 text-sm font-semibold text-slate-900 transition hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+              >
+                {activeAction === "query" ? "Searching..." : "Run Semantic Search"}
+              </button>
+              <button
+                onClick={handleGenerateAnswer}
+                disabled={activeAction !== null}
+                className="w-full rounded-2xl bg-slate-900 px-6 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-500"
+              >
+                {activeAction === "ask" ? "Generating..." : "Generate Answer"}
+              </button>
+            </div>
 
             {searchError && (
               <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -265,7 +328,8 @@ export default function Home() {
             )}
 
             <div className="text-xs text-slate-600">
-              Results are ranked by cosine similarity on local embeddings.
+              Semantic search is fully local. Generate Answer uses your configured AI
+              provider only after the top matches are retrieved.
             </div>
           </section>
         </div>

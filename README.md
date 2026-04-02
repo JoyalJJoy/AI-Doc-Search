@@ -84,12 +84,20 @@ Open your browser at `http://localhost:3000`.
 Create `/Users/joyaljoy/source/ai-doc-search/backend/.env`:
 
 ```
-OPENAI_API_KEY=your_api_key_here
+# OpenAI option
+OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4.1-mini
+
+# Gemini option
+# LLM_PROVIDER=gemini
+# GEMINI_API_KEY=your_gemini_api_key_here
+# LLM_MODEL=gemini-2.5-flash
 ```
 
 Notes:
-- `OPENAI_API_KEY` is required only for `/ask` (LLM answers).
+- `/ask` supports OpenAI and Gemini.
+- If `LLM_PROVIDER=gemini`, the backend uses Google's OpenAI-compatible endpoint.
+- If you omit `LLM_PROVIDER`, the backend auto-detects Gemini when the model starts with `gemini` or when only `GEMINI_API_KEY` is set.
 - If you want fully local mode, use `/query` only.
 
 ## API Endpoints
